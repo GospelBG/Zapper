@@ -112,11 +112,141 @@ public final class TransitiveResolver {
         throw new IllegalArgumentException("Failed to find the POM of dependency " + dependency.getMavenPath() + " in the following repositories: " + searchRepositories);
     }
 
+    @SneakyThrows
+    private NodeList getParentPom(
+        @NotNull NodeList pom
+    ) {
+        Set<Repository> repositories = new LinkedHashSet<>();
+        repositories.add(mavenCentral());
+
+        for (int i = 0; i < pom.getLength(); i++) {
+            Node node = pom.item(i);
+            if (node.getNodeName().equals("repositories")) {
+                NodeList repos = node.getChildNodes();
+                for (int j = 0; j < repos.getLength(); j++) {
+                    Node n = repos.item(j);
+                    if (!(n instanceof Element)) continue;
+                    Element repoBlock = (Element) n;
+                    String url = repoBlock.getElementsByTagName("url").item(0).getTextContent();
+                    repositories.add(Repository.maven(url));
+                }
+            }
+        }
+        for (int i = 0; i < pom.getLength(); i++) {
+            if (pom.item(i).getNodeName().equals("parent")) {
+                if (!(pom.item(i) instanceof Element)) continue;
+                Element e = (Element) pom.item(i);
+                Dependency artifact = new Dependency(
+                    e.getElementsByTagName("groupId").item(0).getTextContent(),
+                    e.getElementsByTagName("artifactId").item(0).getTextContent(),
+                    e.getElementsByTagName("version").item(0).getTextContent());
+                
+                for (Repository repository : repositories) {
+                    try (InputStream s = repository.resolvePom(artifact).openStream()) {
+                        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+                        DocumentBuilder builder = factory.newDocumentBuilder();
+                        Document doc = builder.parse(s);
+                        NodeList list = doc.getDocumentElement().getChildNodes();
+
+                        return list;
+                    } catch (Exception e2) {
+                        if (!(e2 instanceof FileNotFoundException))
+                            throw e2;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Parses the parent POM file and extracts the version of the dependency.
+     *
+     * @param dependency The original dependency for which transitive dependencies are being resolved.
+     * @param stream     The InputStream of the parent POM file to parse.
+     * @return The version of the dependency declared in the parent POM.
+     */
+    @SneakyThrows
+    private @NotNull String getVersionFromParent(
+            @NotNull Dependency dependency,
+            @NotNull NodeList pom
+    ) {        
+        Set<Repository> repositories = new LinkedHashSet<>();
+        repositories.add(mavenCentral());
+
+        String version = "";
+
+        for (int i = 0; i < pom.getLength(); i++) {
+            Node node = pom.item(i);
+            if (recursively && node.getNodeName().equals("repositories")) {
+                NodeList repos = node.getChildNodes();
+                for (int j = 0; j < repos.getLength(); j++) {
+                    Node n = repos.item(j);
+                    if (!(n instanceof Element)) continue;
+                    Element repoBlock = (Element) n;
+                    String url = repoBlock.getElementsByTagName("url").item(0).getTextContent();
+                    repositories.add(Repository.maven(url));
+                }
+            }
+            if (node.getNodeName().equals("dependencies") || node.getNodeName().equals("dependencyManagement")) {
+                NodeList deps = node.getChildNodes();
+                for (int j = 0; j < deps.getLength(); j++) {
+                    Node n = deps.item(j);
+                    if (!(n instanceof Element)) continue;
+                    Element dependencyBlock = (Element) n;
+                    String groupId = dependencyBlock.getElementsByTagName("groupId").item(0).getTextContent();
+                    if (groupId.equals("${project.groupId}")) groupId = dependency.getGroupId();
+
+                    if (groupId.equals(dependency.getGroupId()) && dependencyBlock.getElementsByTagName("artifactId").item(0).getTextContent().equals(dependency.getArtifactId())) {
+                        try {
+                            version = dependencyBlock.getElementsByTagName("version").item(0).getTextContent();
+                            if (version.startsWith("${")) {
+                            if (version.equals("${project.version}")) version = dependency.getVersion();
+                            else {
+                                // Search for property
+                                version = getProperty(version.replace("${", "").replace("}", ""), pom);
+                            }
+                        }
+                        } catch (NullPointerException e) {
+                            version = getVersionFromParent(dependency, getParentPom(pom));
+                        }
+                        return version;
+                    }
+                }
+            }
+        }
+        throw new NullPointerException("Could not find version for artifact " + dependency.getGroupId() + ":" + dependency.getArtifactId());
+    }
+
+    @SneakyThrows
+    private String getProperty(
+        @NotNull String key,
+        @NotNull NodeList pom
+    ) {
+        for (int i = 0; i < pom.getLength(); i++) {
+            if (pom.item(i).getNodeName().equals("properties")) {
+                NodeList properties = pom.item(i).getChildNodes();
+                for (int j = 0; j < properties.getLength(); j++) {
+                    if (properties.item(j).getNodeName().equals(key)) {
+                        return properties.item(j).getTextContent();
+                    }
+                }
+            }
+        }
+        // In case of no match, search parent POMs
+        NodeList parent = getParentPom(pom);
+        if (parent != null) {
+            return getProperty(key, getParentPom(pom));
+        } else {
+            throw new NullPointerException("Unable to find property " + key);
+        }
+    }
+
     /**
      * Parses the POM file and extracts the dependencies from it.
      *
      * @param dependency The original dependency for which transitive dependencies are being resolved.
-     * @param stream     The InputStream of the POM file to parse.
+     * @param stream     The InputStream of the parent POM file.
      * @return The list of dependencies extracted from the POM file.
      */
     @SneakyThrows
@@ -145,7 +275,7 @@ public final class TransitiveResolver {
                     repositories.add(Repository.maven(url));
                 }
             }
-            if (node.getNodeName().equals("dependencies")) {
+            if (node.getNodeName().equals("dependencies") || node.getNodeName().equals("dependencyManagement")) {
                 NodeList deps = node.getChildNodes();
                 for (int j = 0; j < deps.getLength(); j++) {
                     Node n = deps.item(j);
@@ -157,11 +287,23 @@ public final class TransitiveResolver {
                     MavenScope scope = MavenScope.COMPILE;
                     try {
                         version = dependencyBlock.getElementsByTagName("version").item(0).getTextContent();
+                        if (version.startsWith("${")) {
+                            if (version.equals("${project.version}")) version = dependency.getVersion();
+                            else {
+                                // Search for property
+                                version = getProperty(version.replace("${", "").replace("}", ""), list);
+                            }
+                        }
+                    } catch (NullPointerException ignored) {
+                        // If version is not declared, look for version in parent pom
+                        version = getVersionFromParent(dependency, getParentPom(list));
+                    }
+                    try {
                         scope = MavenScope.fromString(dependencyBlock.getElementsByTagName("scope").item(0).getTextContent());
                     } catch (NullPointerException ignored) {
                     }
                     if (groupId.equals("${project.groupId}")) groupId = dependency.getGroupId();
-                    if (version.equals("${project.version}")) version = dependency.getVersion();
+                    
                     if (scope != null && scopes.contains(scope) && !version.isEmpty()) {
                         Dependency e = new Dependency(groupId, artifactId, version);
                         dependencies.add(e);
